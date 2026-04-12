@@ -94,40 +94,54 @@ class CarlaGymEnv(gym.Env):
         vector_to_wp = ego_location - waypoint.transform.location
         distance_to_center = abs(vector_to_wp.x * wp_right.x + vector_to_wp.y * wp_right.y)
 
-        # 1. 碰撞惩罚 (加入动能惩罚，让它对高速撞墙产生极度恐惧)
+        # ---------------- 致命错误惩罚（统一标准） ----------------
+        # 1. 碰撞惩罚
         if self.has_collided:
-            # 基础惩罚 -200，外加当前速度的惩罚（速度越快扣分越恐怖）
-            crash_penalty = -200.0 - (v_current * 10.0)
+            # 减轻基础惩罚，强化速度惩罚，让它明白“撞击不是最坏的，高速撞击才是”
+            crash_penalty = -150.0 - (v_current * 10.0)
             return crash_penalty, True
 
+        # 2. 出界/偏离车道惩罚
         if distance_to_center > 2.0:
-            return -50.0, True
+            # 【重要修改】偏离车道应该等同于低速碰撞，堵死“冲出赛道逃脱惩罚”的漏洞
+            return -150.0, True
 
-        # 2. 【强化】进度奖励 (从 2.0 提升到 5.0，重赏之下必有勇夫)
+            # ---------------- 存活与进度奖励 ----------------
+        # 3. 【新增】基础存活奖励：只要活着且在车道内，就有分（这能直接拉升存活步数）
+        reward += 0.5
+
+        # 4. 【修改】进度奖励（限制最高速度目标）
         wp_forward = waypoint.transform.get_forward_vector()
         v_progress = velocity.x * wp_forward.x + velocity.y * wp_forward.y
-        r_progress = 5.0 * (v_progress / 30.0)
+
+        target_speed = 15.0  # 设定一个合理的市区目标速度，约等于 54km/h
+        if v_progress <= target_speed:
+            # 正常加速区间
+            r_progress = 3.0 * (v_progress / target_speed)
+        else:
+            # 【重要修改】超过目标速度后，不再给予额外奖励，甚至可以轻微惩罚
+            r_progress = 3.0 - (v_progress - target_speed) * 0.2
+            r_progress = max(0.0, r_progress)  # 防止扣成负数
+
         reward += r_progress
 
-        # 3. 【新增】航向角一致性奖励 (引导它顺着路转弯，解决 30 秒魔咒)
+        # ---------------- 姿态与舒适度 ----------------
+        # 5. 航向角一致性奖励
         ego_yaw = ego_transform.rotation.yaw
         wp_yaw = waypoint.transform.rotation.yaw
-        # 计算角度差并归一化
         yaw_diff = abs((ego_yaw - wp_yaw + 180) % 360 - 180)
-        r_heading = 2.0 * (1.0 - min(yaw_diff / 30.0, 1.0))  # 偏航 30 度以内都有奖
+        r_heading = 2.0 * (1.0 - min(yaw_diff / 30.0, 1.0))
         reward += r_heading
 
-        # 4. 【修正】车道保持惩罚
+        # 6. 车道保持奖励
         r_lane = 1.0 * (1.0 - min(distance_to_center / 1.5, 1.0))
+        reward += r_lane
 
-        # 怠工判定 (加入 60 步免责期)
-        if v_progress < 1.0 and self.current_step > 60:
-            r_lane = 0.0
-            reward -= 2.0  # 加重怠工惩罚
-        else:
-            reward += r_lane
+        # 7. 【放宽】怠工判定
+        if v_progress < 0.5 and self.current_step > 60:  # 将速度阈值从 1.0 降到 0.5
+            reward -= 1.0  # 减轻惩罚，允许在转弯时合理慢速
 
-        # 5. 舒适性 (轻微惩罚即可)
+        # 8. 舒适性惩罚
         angular_velocity = self.ego_vehicle.get_angular_velocity()
         r_comfort = -0.2 * (abs(angular_velocity.z) / 5.0)
         reward += r_comfort
