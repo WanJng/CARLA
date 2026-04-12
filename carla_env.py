@@ -84,10 +84,6 @@ class CarlaGymEnv(gym.Env):
         reward = 0.0
         terminated = False
 
-        # 1. 碰撞与出界 (保持严厉惩罚)
-        if self.has_collided:
-            return -100.0, True
-
         velocity = self.ego_vehicle.get_velocity()
         v_current = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
         ego_transform = self.ego_vehicle.get_transform()
@@ -97,6 +93,12 @@ class CarlaGymEnv(gym.Env):
         wp_right = waypoint.transform.get_right_vector()
         vector_to_wp = ego_location - waypoint.transform.location
         distance_to_center = abs(vector_to_wp.x * wp_right.x + vector_to_wp.y * wp_right.y)
+
+        # 1. 碰撞惩罚 (加入动能惩罚，让它对高速撞墙产生极度恐惧)
+        if self.has_collided:
+            # 基础惩罚 -200，外加当前速度的惩罚（速度越快扣分越恐怖）
+            crash_penalty = -200.0 - (v_current * 10.0)
+            return crash_penalty, True
 
         if distance_to_center > 2.0:
             return -50.0, True
