@@ -81,18 +81,15 @@ class CarlaGymEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def _get_reward(self):
-        """多目标奖励函数引擎"""
         reward = 0.0
         terminated = False
 
-        # 1. 碰撞惩罚 (一票否决)
+        # 1. 碰撞与出界 (保持严厉惩罚)
         if self.has_collided:
             return -100.0, True
 
-        # 获取车辆物理状态
         velocity = self.ego_vehicle.get_velocity()
         v_current = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
-
         ego_transform = self.ego_vehicle.get_transform()
         ego_location = ego_transform.location
         waypoint = self.map.get_waypoint(ego_location)
@@ -101,37 +98,36 @@ class CarlaGymEnv(gym.Env):
         vector_to_wp = ego_location - waypoint.transform.location
         distance_to_center = abs(vector_to_wp.x * wp_right.x + vector_to_wp.y * wp_right.y)
 
-        # 2. 出界判定 (一票否决)
         if distance_to_center > 2.0:
             return -50.0, True
 
-        # 3. 密集型进度奖励 (【修改】将进步的奖励翻倍，重赏之下必有勇夫)
+        # 2. 【强化】进度奖励 (从 2.0 提升到 5.0，重赏之下必有勇夫)
         wp_forward = waypoint.transform.get_forward_vector()
         v_progress = velocity.x * wp_forward.x + velocity.y * wp_forward.y
-        r_progress = 2.0 * (v_progress / 30.0)  # 权重从 1.0 改为 2.0
+        r_progress = 5.0 * (v_progress / 30.0)
         reward += r_progress
 
-        # 4. 速度奖励 (保持不变)
-        r_speed = 2.0 * (v_current / 15.0) if v_current <= 15.0 else 2.0
-        reward += r_speed
+        # 3. 【新增】航向角一致性奖励 (引导它顺着路转弯，解决 30 秒魔咒)
+        ego_yaw = ego_transform.rotation.yaw
+        wp_yaw = waypoint.transform.rotation.yaw
+        # 计算角度差并归一化
+        yaw_diff = abs((ego_yaw - wp_yaw + 180) % 360 - 180)
+        r_heading = 2.0 * (1.0 - min(yaw_diff / 30.0, 1.0))  # 偏航 30 度以内都有奖
+        reward += r_heading
 
-        # ---------------------------------------------------------
-        # 5. 【核心修正】车道保持与消极怠工惩罚 (加入 3 秒免责期)
-        # ---------------------------------------------------------
+        # 4. 【修正】车道保持惩罚
         r_lane = 1.0 * (1.0 - min(distance_to_center / 1.5, 1.0))
 
-        # 给 AI 前 60 步 (约 3 秒) 的起步发力时间，在此期间不判怠工！
+        # 怠工判定 (加入 60 步免责期)
         if v_progress < 1.0 and self.current_step > 60:
             r_lane = 0.0
-            reward -= 1.0
+            reward -= 2.0  # 加重怠工惩罚
         else:
             reward += r_lane
-        # ---------------------------------------------------------
 
-        # 6. 舒适性惩罚
+        # 5. 舒适性 (轻微惩罚即可)
         angular_velocity = self.ego_vehicle.get_angular_velocity()
-        a_yaw = abs(angular_velocity.z)
-        r_comfort = -0.5 * (a_yaw / 5.0)
+        r_comfort = -0.2 * (abs(angular_velocity.z) / 5.0)
         reward += r_comfort
 
         return reward, terminated

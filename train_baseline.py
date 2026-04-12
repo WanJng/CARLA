@@ -23,12 +23,12 @@ def main():
         env=env,
         verbose=1,
         tensorboard_log=log_dir,
-        learning_rate=3e-4,     # PPO 的经典初始学习率
+        learning_rate=2e-4,     # 稍微调低学习率，更精细地学习转弯动作
         n_steps=4096,           # 每次更新前收集的步数【修改】收集更多数据再更新一次，防止一惊一乍
         batch_size=256,          # 每次梯度下降的批次大小【修改】配合更大的 n_steps
         n_epochs=10,            # 每次收集数据后优化策略的轮数
         gamma=0.99,             # 折扣因子，0.99 适合这种偏长期的驾驶任务
-        ent_coef=0.02,  # 【新增】强制加入 2% 的随机探索，防止它太早认命！
+        ent_coef=0.05,  # 降低探索率，开始让它强化学到的正确动作
         device="cuda"
     )
 
