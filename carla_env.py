@@ -19,77 +19,154 @@ class CarlaGymEnv(gym.Env):
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
 
-        # 2. 强制加载 Town01 (适合基准直路训练)
         self.world = self.client.get_world()
         if not self.world.get_map().name.endswith('Town01'):
             print("正在加载 Town01 地图...")
             self.world = self.client.load_world('Town01')
 
+        # 2. 开启同步模式与固定时间步长
+        settings = self.world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05
+        self.world.apply_settings(settings)
+
         self.blueprint_library = self.world.get_blueprint_library()
         self.map = self.world.get_map()
 
-        # 3. 实体追踪器
+        # 3. 实体追踪器与传感器状态
         self.ego_vehicle = None
-        self.npc_vehicle = None  # 新增 NPC 追踪
+        self.npc_vehicle = None
+        self.collision_sensor = None
+        self.has_collided = False
+
+        # 【新增】回合步数控制
+        self.max_steps = 2000  # 约 100 秒物理时间
+        self.current_step = 0
 
         # 4. 定义动作空间与状态空间
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
 
     def step(self, action):
-        """
-        环境步进：执行动作 -> 推进物理 -> 返回新状态
-        """
-        # 1. 解析动作并应用到自车
+        """核心步进函数：打通强化学习的 MDP 闭环"""
+        # 【新增】步数累加
+        self.current_step += 1
+
+        # 1. 解析解耦后的动作
         steer = float(action[0])
         throttle_brake = float(action[1])
 
-        # 核心技巧：分离合并的油门/刹车指令
         throttle = throttle_brake if throttle_brake > 0 else 0.0
         brake = -throttle_brake if throttle_brake < 0 else 0.0
 
-        control = carla.VehicleControl(steer=steer, throttle=throttle, brake=brake)
+        control = carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
         self.ego_vehicle.apply_control(control)
 
-        # 2. 等待 CARLA 服务端进行一次物理 Tick
-        self.world.wait_for_tick()
+        # 2. 使用同步推进
+        self.world.tick()
 
-        # 3. 获取下一帧观测 (由第三步详细实现)
+        # 3. 获取新状态
         obs = self._get_observation()
 
-        # 4. 计算 Reward (第二阶段实现，当前先给 0)
-        reward = 0.0
+        # 4. 计算奖励与回合终止标志
+        reward, terminated = self._get_reward()
 
-        # 5. 判定回合是否结束 (撞车/超时等，当前先给 False)
-        terminated = False
+        # 【新增】截断判定：达到最大步数上限则截断回合
         truncated = False
+        if self.current_step >= self.max_steps:
+            truncated = True
+
         info = {}
 
         return obs, reward, terminated, truncated, info
 
+    def _get_reward(self):
+        """多目标奖励函数引擎"""
+        reward = 0.0
+        terminated = False
+
+        # 1. 碰撞惩罚 (一票否决)
+        if self.has_collided:
+            return -100.0, True
+
+        # 获取车辆物理状态
+        velocity = self.ego_vehicle.get_velocity()
+        v_current = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
+
+        ego_transform = self.ego_vehicle.get_transform()
+        ego_location = ego_transform.location
+        waypoint = self.map.get_waypoint(ego_location)
+
+        wp_right = waypoint.transform.get_right_vector()
+        vector_to_wp = ego_location - waypoint.transform.location
+        distance_to_center = abs(vector_to_wp.x * wp_right.x + vector_to_wp.y * wp_right.y)
+
+        # 2. 出界判定 (一票否决)
+        if distance_to_center > 2.0:
+            return -50.0, True
+
+        # 3. 密集型进度奖励
+        wp_forward = waypoint.transform.get_forward_vector()
+        v_progress = velocity.x * wp_forward.x + velocity.y * wp_forward.y
+        r_progress = 1.0 * (v_progress / 30.0)
+        reward += r_progress
+
+        # 4. 速度奖励
+        r_speed = 2.0 * (v_current / 15.0) if v_current <= 15.0 else 2.0
+        reward += r_speed
+
+        # ---------------------------------------------------------
+        # 5. 【核心修正】车道保持与消极怠工惩罚
+        # ---------------------------------------------------------
+        r_lane = 1.0 * (1.0 - min(distance_to_center / 1.5, 1.0))
+
+        if v_progress < 1.0:
+            # 如果车辆前向投影速度低于 1 m/s (约 3.6 km/h)，视为原地怠工
+            r_lane = 0.0  # 熔断：剥夺车道保持奖励
+            reward -= 1.0  # 鞭策：每停滞一步，扣除 1.0 分
+        else:
+            # 只有当车辆真正动起来时，才给予车道居中奖励
+            reward += r_lane
+        # ---------------------------------------------------------
+
+        # 6. 舒适性惩罚
+        angular_velocity = self.ego_vehicle.get_angular_velocity()
+        a_yaw = abs(angular_velocity.z)
+        r_comfort = -0.5 * (a_yaw / 5.0)
+        reward += r_comfort
+
+        return reward, terminated
+
     def reset(self, seed=None, options=None):
-        """环境重置：搭建新手村场景"""
+        """环境重置：搭建新手村场景并挂载痛觉神经"""
         super().reset(seed=seed)
-        self._clear_actors()  # 先清理上一局的残留
+        self._clear_actors()
+        self.has_collided = False
+
+        # 【新增】重置当前步数
+        self.current_step = 0
 
         # 1. 随机选择生成点并生成自车 (Ego)
         ego_bp = random.choice(self.blueprint_library.filter('vehicle.tesla.model3'))
         spawn_points = self.map.get_spawn_points()
 
-        # 尝试生成自车
         ego_spawn_point = random.choice(spawn_points)
         self.ego_vehicle = self.world.try_spawn_actor(ego_bp, ego_spawn_point)
 
-        # 如果自车生成失败（极少情况），递归重试
         if self.ego_vehicle is None:
             return self.reset()
 
-        # 2. 计算自车正前方 20 米的坐标，生成 NPC
+        # 2. 给自车挂载碰撞传感器
+        collision_bp = self.blueprint_library.find('sensor.other.collision')
+        self.collision_sensor = self.world.try_spawn_actor(
+            collision_bp, carla.Transform(), attach_to=self.ego_vehicle)
+        self.collision_sensor.listen(lambda event: self._on_collision(event))
+
+        # 3. 计算自车正前方 20 米的坐标，生成 NPC
         npc_bp = random.choice(self.blueprint_library.filter('vehicle.audi.a2'))
         ego_transform = self.ego_vehicle.get_transform()
         forward_vector = ego_transform.get_forward_vector()
 
-        # 沿自车朝向向前推进 20 米，高度稍微抬高 0.5 米防止卡地模型
         npc_spawn_transform = carla.Transform(
             carla.Location(
                 x=ego_transform.location.x + forward_vector.x * 20.0,
@@ -101,20 +178,18 @@ class CarlaGymEnv(gym.Env):
 
         self.npc_vehicle = self.world.try_spawn_actor(npc_bp, npc_spawn_transform)
 
-        # 如果前方有障碍物导致 NPC 生成失败，放弃该回合重新重置
         if self.npc_vehicle is None:
             return self.reset()
 
-        # 3. 赋予 NPC 初始行为：匀速傻瓜车
-        # 禁用 Autopilot，直接给 40% 的油门，不打方向盘
+        # 4. 赋予 NPC 初始行为：匀速车
         self.npc_vehicle.set_autopilot(False)
         npc_control = carla.VehicleControl(throttle=0.4, steer=0.0, brake=0.0)
         self.npc_vehicle.apply_control(npc_control)
 
-        # 4. 等待物理引擎稳定
-        time.sleep(0.1)
+        # 5. 同步模式下等待物理引擎稳定
+        for _ in range(5):
+            self.world.tick()
 
-        # 5. 获取初始观测值
         obs = self._get_observation()
         info = {}
 
@@ -233,6 +308,12 @@ class CarlaGymEnv(gym.Env):
 
     def _clear_actors(self):
         """严谨的资源回收机制，防止显存泄漏"""
+        # 新增：优先销毁传感器
+        if self.collision_sensor is not None:
+            self.collision_sensor.stop()
+            self.collision_sensor.destroy()
+            self.collision_sensor = None
+
         if self.ego_vehicle is not None:
             self.ego_vehicle.destroy()
             self.ego_vehicle = None
@@ -241,8 +322,20 @@ class CarlaGymEnv(gym.Env):
             self.npc_vehicle.destroy()
             self.npc_vehicle = None
 
+    def _on_collision(self, event):
+        """碰撞传感器回调函数"""
+        self.has_collided = True
+
     def close(self):
         """
         关闭环境时的清理工作
         """
         self._clear_actors()
+
+        # 退出时恢复异步模式，防止 CARLA 服务端假死
+        try:
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            self.world.apply_settings(settings)
+        except Exception as e:
+            print(f"关闭同步模式时发生异常: {e}")
