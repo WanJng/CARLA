@@ -23,7 +23,7 @@ class CarlaGymEnv(gym.Env):
         if not self.world.get_map().name.endswith('Town01'):
             print("正在加载 Town01 地图...")
             self.world = self.client.load_world('Town01')
-
+        self._clear_all_zombies()
         # 2. 开启同步模式与固定时间步长
         settings = self.world.get_settings()
         settings.synchronous_mode = True
@@ -347,6 +347,18 @@ class CarlaGymEnv(gym.Env):
         if self.npc_vehicle is not None:
             self.npc_vehicle.destroy()
             self.npc_vehicle = None
+
+    def _clear_all_zombies(self):
+        """无差别全局大扫除"""
+        print("正在清理世界中的残留实体...")
+        # 销毁所有残留车辆
+        vehicles = self.world.get_actors().filter('*vehicle*')
+        for v in vehicles:
+            v.destroy()
+        # 销毁所有残留传感器
+        sensors = self.world.get_actors().filter('*sensor*')
+        for s in sensors:
+            s.destroy()
 
     def _on_collision(self, event):
         """碰撞传感器回调函数"""

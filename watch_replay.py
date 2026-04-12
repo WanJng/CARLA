@@ -3,9 +3,22 @@ import time
 
 
 def main():
-    recording_name = "ppo_final_eval_3.log"
+    recording_name = "ppo_final_eval_9.log"
     client = carla.Client('localhost', 2000)
     client.set_timeout(10.0)
+
+    # 彻底清理场景中的所有僵尸车辆和传感器
+    world = client.get_world()
+    actors = world.get_actors()
+    vehicles = actors.filter('vehicle.*')
+    sensors = actors.filter('sensor.*')
+
+    for v in vehicles:
+        v.destroy()
+    for s in sensors:
+        s.destroy()
+
+    print(f"♻️ 已清理 {len(vehicles)} 辆僵尸车和 {len(sensors)} 个传感器")
 
     print(f"正在加载回放文件: {recording_name}")
 
@@ -40,19 +53,7 @@ def main():
     # 3. 核心魔法：第四个参数传入车辆 ID！
     # 引擎接管视角，从 0 秒重新播放，完美丝滑不闪烁
     client.replay_file(recording_name, 0, 0, ego_vehicle.id)
-
-    print("=======================================")
     print("🎬 原生视角回放已启动，请切回 CARLA 窗口观看！")
-    print("按 Ctrl+C 随时结束本脚本（不影响播放）")
-    print("=======================================")
-
-    try:
-        # 保持脚本活着就行，不用再手动算坐标了
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n脚本退出。")
-
 
 if __name__ == "__main__":
     main()
