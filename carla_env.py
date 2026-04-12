@@ -105,56 +105,60 @@ class CarlaGymEnv(gym.Env):
         vector_to_wp = ego_location - waypoint.transform.location
         distance_to_center = abs(vector_to_wp.x * wp_right.x + vector_to_wp.y * wp_right.y)
 
-        # ---------------- 1. 致命错误：一票否决 ----------------
+        # ---------------- 1. 致命错误 ----------------
         if self.has_collided:
-            return -150.0, True
-
+            return -200.0, True
         if distance_to_center > 2.0:
-            return -150.0, True
+            return -200.0, True
 
-        # ---------------- 2. 僵死熔断机制 (Anti-Standstill) ----------------
-        # 给予前 50 步的启动宽容期。之后如果速度过低，开始累计僵死步数
-        if self.current_step > 50:
-            if v_current < 1.0:  # 速度不足 1m/s (约 3.6km/h) 视为怠工
+        # ---------------- 2. 僵死熔断 ----------------
+        if getattr(self, 'current_step', 0) > 50:
+            if getattr(self, 'stuck_steps', None) is None:
+                self.stuck_steps = 0
+
+            if v_current < 1.0:
                 self.stuck_steps += 1
             else:
-                self.stuck_steps = 0  # 一旦跑起来就清零
+                self.stuck_steps = 0
 
-            # 如果连续 30 步（约 1-3 秒，取决于 tick_rate）原地不动，直接判死刑
             if self.stuck_steps > 30:
-                # 给予一个甚至比出界更严厉或等同的惩罚，告诉它“不走不如死”
-                return -150.0, True
+                return -20.0, True
         else:
             self.stuck_steps = 0
 
-        # ---------------- 3. 核心驱动力：有效进度奖励 ----------------
+        # ---------------- 3. 核心驱动力（防作弊版） ----------------
         wp_forward = waypoint.transform.get_forward_vector()
-        # 计算车辆在车道前进方向上的投影速度 (有效速度)
         v_progress = velocity.x * wp_forward.x + velocity.y * wp_forward.y
+        target_speed = 10.0
 
-        target_speed = 10.0  # 初始目标速度设定为 10m/s (36km/h)，容易达成
-
-        # 业界做法：进度奖励应该是线性的，直到达到限速
         if v_progress > 0.5:
-            # 只有产生实质位移才给分，最高给 3.0 分
-            r_progress = 3.0 * min(v_progress / target_speed, 1.0)
-            reward += r_progress
-        elif v_progress < 0:
-            # 严惩倒车行为
+            # 只有车子真正在往前开，才开始计分！
+            base_progress_reward = 3.0 * min(v_progress / target_speed, 1.0)
+            safety_factor = 1.0 - min(distance_to_center / 2.0, 1.0)
+            reward += base_progress_reward * safety_factor
+
+            # 【核心修改】把姿态奖励收束到前进状态下。原地不动则没有这些奖励！
+            ego_yaw = ego_transform.rotation.yaw
+            wp_yaw = waypoint.transform.rotation.yaw
+            yaw_diff = abs((ego_yaw - wp_yaw + 180) % 360 - 180)
+            r_heading = 0.5 * (1.0 - min(yaw_diff / 15.0, 1.0))
+            reward += r_heading
+
+            r_lane = 0.5 * (1.0 - min(distance_to_center / 1.0, 1.0))
+            reward += r_lane
+
+        elif v_progress < -0.5:
+            # 严惩倒车
             reward -= 2.0
+        else:
+            # 【新增】怠速/龟速状态，不仅没奖励，还要给微小的惩罚，逼它动起来
+            reward -= 0.1
 
-        # ---------------- 4. 辅助约束：姿态与平顺性 ----------------
-        # 航向角一致性 (鼓励车头对准车道)
-        ego_yaw = ego_transform.rotation.yaw
-        wp_yaw = waypoint.transform.rotation.yaw
-        yaw_diff = abs((ego_yaw - wp_yaw + 180) % 360 - 180)
-        # 如果偏差在 15 度以内，给少量奖励；超过则无奖励
-        r_heading = 0.5 * (1.0 - min(yaw_diff / 15.0, 1.0))
-        reward += r_heading
-
-        # 居中保持奖励
-        r_lane = 0.5 * (1.0 - min(distance_to_center / 1.0, 1.0))
-        reward += r_lane
+        # ---------------- 4. 舒适性惩罚 ----------------
+        # 无论动不动，只要乱打方向盘就扣分，防止它原地抽搐
+        angular_velocity = self.ego_vehicle.get_angular_velocity()
+        r_comfort = -0.5 * (abs(angular_velocity.z) / 5.0)
+        reward += r_comfort
 
         return reward, terminated
 
@@ -166,6 +170,7 @@ class CarlaGymEnv(gym.Env):
 
         # 【新增】重置当前步数
         self.current_step = 0
+        self.stuck_steps = 0
 
         # 1. 随机选择生成点并生成自车 (Ego)
         ego_bp = random.choice(self.blueprint_library.filter('vehicle.tesla.model3'))
