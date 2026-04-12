@@ -47,6 +47,17 @@ class CarlaGymEnv(gym.Env):
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
 
+    def start_recording(self, filename):
+        """【新增】开启 CARLA 官方录制器，记录所有 Actor 轨迹"""
+        # 文件会保存在 CARLA 服务端所在的路径下 (例如 /carla/dist/carla/PythonAPI/examples/)
+        print(f"开始录制到文件: {filename}")
+        self.client.start_recorder(filename)
+
+    def stop_recording(self):
+        """【新增】停止录制"""
+        print("停止录制。")
+        self.client.stop_recorder()
+
     def step(self, action):
         """核心步进函数：打通强化学习的 MDP 闭环"""
         # 【新增】步数累加
@@ -94,57 +105,56 @@ class CarlaGymEnv(gym.Env):
         vector_to_wp = ego_location - waypoint.transform.location
         distance_to_center = abs(vector_to_wp.x * wp_right.x + vector_to_wp.y * wp_right.y)
 
-        # ---------------- 致命错误惩罚（统一标准） ----------------
-        # 1. 碰撞惩罚
+        # ---------------- 1. 致命错误：一票否决 ----------------
         if self.has_collided:
-            # 减轻基础惩罚，强化速度惩罚，让它明白“撞击不是最坏的，高速撞击才是”
-            crash_penalty = -150.0 - (v_current * 10.0)
-            return crash_penalty, True
-
-        # 2. 出界/偏离车道惩罚
-        if distance_to_center > 2.0:
-            # 【重要修改】偏离车道应该等同于低速碰撞，堵死“冲出赛道逃脱惩罚”的漏洞
             return -150.0, True
 
-            # ---------------- 存活与进度奖励 ----------------
-        # 3. 【新增】基础存活奖励：只要活着且在车道内，就有分（这能直接拉升存活步数）
-        reward += 0.5
+        if distance_to_center > 2.0:
+            return -150.0, True
 
-        # 4. 【修改】进度奖励（限制最高速度目标）
+        # ---------------- 2. 僵死熔断机制 (Anti-Standstill) ----------------
+        # 给予前 50 步的启动宽容期。之后如果速度过低，开始累计僵死步数
+        if self.current_step > 50:
+            if v_current < 1.0:  # 速度不足 1m/s (约 3.6km/h) 视为怠工
+                self.stuck_steps += 1
+            else:
+                self.stuck_steps = 0  # 一旦跑起来就清零
+
+            # 如果连续 30 步（约 1-3 秒，取决于 tick_rate）原地不动，直接判死刑
+            if self.stuck_steps > 30:
+                # 给予一个甚至比出界更严厉或等同的惩罚，告诉它“不走不如死”
+                return -150.0, True
+        else:
+            self.stuck_steps = 0
+
+        # ---------------- 3. 核心驱动力：有效进度奖励 ----------------
         wp_forward = waypoint.transform.get_forward_vector()
+        # 计算车辆在车道前进方向上的投影速度 (有效速度)
         v_progress = velocity.x * wp_forward.x + velocity.y * wp_forward.y
 
-        target_speed = 15.0  # 设定一个合理的市区目标速度，约等于 54km/h
-        if v_progress <= target_speed:
-            # 正常加速区间
-            r_progress = 3.0 * (v_progress / target_speed)
-        else:
-            # 【重要修改】超过目标速度后，不再给予额外奖励，甚至可以轻微惩罚
-            r_progress = 3.0 - (v_progress - target_speed) * 0.2
-            r_progress = max(0.0, r_progress)  # 防止扣成负数
+        target_speed = 10.0  # 初始目标速度设定为 10m/s (36km/h)，容易达成
 
-        reward += r_progress
+        # 业界做法：进度奖励应该是线性的，直到达到限速
+        if v_progress > 0.5:
+            # 只有产生实质位移才给分，最高给 3.0 分
+            r_progress = 3.0 * min(v_progress / target_speed, 1.0)
+            reward += r_progress
+        elif v_progress < 0:
+            # 严惩倒车行为
+            reward -= 2.0
 
-        # ---------------- 姿态与舒适度 ----------------
-        # 5. 航向角一致性奖励
+        # ---------------- 4. 辅助约束：姿态与平顺性 ----------------
+        # 航向角一致性 (鼓励车头对准车道)
         ego_yaw = ego_transform.rotation.yaw
         wp_yaw = waypoint.transform.rotation.yaw
         yaw_diff = abs((ego_yaw - wp_yaw + 180) % 360 - 180)
-        r_heading = 2.0 * (1.0 - min(yaw_diff / 30.0, 1.0))
+        # 如果偏差在 15 度以内，给少量奖励；超过则无奖励
+        r_heading = 0.5 * (1.0 - min(yaw_diff / 15.0, 1.0))
         reward += r_heading
 
-        # 6. 车道保持奖励
-        r_lane = 1.0 * (1.0 - min(distance_to_center / 1.5, 1.0))
+        # 居中保持奖励
+        r_lane = 0.5 * (1.0 - min(distance_to_center / 1.0, 1.0))
         reward += r_lane
-
-        # 7. 【放宽】怠工判定
-        if v_progress < 0.5 and self.current_step > 60:  # 将速度阈值从 1.0 降到 0.5
-            reward -= 1.0  # 减轻惩罚，允许在转弯时合理慢速
-
-        # 8. 舒适性惩罚
-        angular_velocity = self.ego_vehicle.get_angular_velocity()
-        r_comfort = -0.2 * (abs(angular_velocity.z) / 5.0)
-        reward += r_comfort
 
         return reward, terminated
 
