@@ -3,6 +3,8 @@ from gymnasium import spaces
 import numpy as np
 import carla
 import math
+import random
+import time
 
 class CarlaGymEnv(gym.Env):
     """
@@ -13,25 +15,25 @@ class CarlaGymEnv(gym.Env):
     def __init__(self):
         super(CarlaGymEnv, self).__init__()
 
-        # 1. 连接 CARLA 服务端 (默认本地 2000 端口)
+        # 1. 连接 CARLA 服务端
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
+
+        # 2. 强制加载 Town01 (适合基准直路训练)
         self.world = self.client.get_world()
+        if not self.world.get_map().name.endswith('Town01'):
+            print("正在加载 Town01 地图...")
+            self.world = self.client.load_world('Town01')
+
         self.blueprint_library = self.world.get_blueprint_library()
+        self.map = self.world.get_map()
 
-        # 获取地图所有的默认出生点
-        self.spawn_points = self.world.get_map().get_spawn_points()
-
-        # 内部状态变量
+        # 3. 实体追踪器
         self.ego_vehicle = None
+        self.npc_vehicle = None  # 新增 NPC 追踪
 
-        # 2. 定义动作空间 (Action Space)
-        # action[0]: 转向 (Steer)，范围 [-1.0, 1.0]
-        # action[1]: 油门/刹车 (Throttle/Brake)，范围 [-1.0, 1.0]
+        # 4. 定义动作空间与状态空间
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
-
-        # 3. 定义观测空间 (Observation Space)
-        # 7维纯物理向量，为了神经网络收敛，全部归一化到 [-1.0, 1.0] 或 [0.0, 1.0]
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
 
     def step(self, action):
@@ -66,30 +68,53 @@ class CarlaGymEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def reset(self, seed=None, options=None):
-        """
-        回合重置：清理现场 -> 重新生成 -> 返回初始状态
-        """
+        """环境重置：搭建新手村场景"""
         super().reset(seed=seed)
+        self._clear_actors()  # 先清理上一局的残留
 
-        # 1. 彻底清理上一回合遗留的实体（防止显存泄漏！）
-        self._clear_actors()
+        # 1. 随机选择生成点并生成自车 (Ego)
+        ego_bp = random.choice(self.blueprint_library.filter('vehicle.tesla.model3'))
+        spawn_points = self.map.get_spawn_points()
 
-        # 2. 生成自车 (以 Tesla Model 3 为例)
-        ego_bp = self.blueprint_library.find('vehicle.tesla.model3')
+        # 尝试生成自车
+        ego_spawn_point = random.choice(spawn_points)
+        self.ego_vehicle = self.world.try_spawn_actor(ego_bp, ego_spawn_point)
 
-        # 随机选择一个出生点
-        spawn_point = np.random.choice(self.spawn_points)
-        self.ego_vehicle = self.world.try_spawn_actor(ego_bp, spawn_point)
-
-        # 异常处理：如果由于碰撞等原因生成失败，抛出异常
+        # 如果自车生成失败（极少情况），递归重试
         if self.ego_vehicle is None:
-            raise RuntimeError("自车生成失败，可能是出生点被占用！")
+            return self.reset()
 
-        # 3. 让物理引擎空转几帧，确保车辆稳定落地
-        for _ in range(10):
-            self.world.wait_for_tick()
+        # 2. 计算自车正前方 20 米的坐标，生成 NPC
+        npc_bp = random.choice(self.blueprint_library.filter('vehicle.audi.a2'))
+        ego_transform = self.ego_vehicle.get_transform()
+        forward_vector = ego_transform.get_forward_vector()
 
-        # 4. 获取初始观测值
+        # 沿自车朝向向前推进 20 米，高度稍微抬高 0.5 米防止卡地模型
+        npc_spawn_transform = carla.Transform(
+            carla.Location(
+                x=ego_transform.location.x + forward_vector.x * 20.0,
+                y=ego_transform.location.y + forward_vector.y * 20.0,
+                z=ego_transform.location.z + 0.5
+            ),
+            ego_transform.rotation
+        )
+
+        self.npc_vehicle = self.world.try_spawn_actor(npc_bp, npc_spawn_transform)
+
+        # 如果前方有障碍物导致 NPC 生成失败，放弃该回合重新重置
+        if self.npc_vehicle is None:
+            return self.reset()
+
+        # 3. 赋予 NPC 初始行为：匀速傻瓜车
+        # 禁用 Autopilot，直接给 40% 的油门，不打方向盘
+        self.npc_vehicle.set_autopilot(False)
+        npc_control = carla.VehicleControl(throttle=0.4, steer=0.0, brake=0.0)
+        self.npc_vehicle.apply_control(npc_control)
+
+        # 4. 等待物理引擎稳定
+        time.sleep(0.1)
+
+        # 5. 获取初始观测值
         obs = self._get_observation()
         info = {}
 
@@ -207,12 +232,14 @@ class CarlaGymEnv(gym.Env):
         return target_vehicle
 
     def _clear_actors(self):
-        """
-        安全销毁场景中的实体
-        """
+        """严谨的资源回收机制，防止显存泄漏"""
         if self.ego_vehicle is not None:
             self.ego_vehicle.destroy()
             self.ego_vehicle = None
+
+        if self.npc_vehicle is not None:
+            self.npc_vehicle.destroy()
+            self.npc_vehicle = None
 
     def close(self):
         """
