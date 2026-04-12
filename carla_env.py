@@ -105,27 +105,26 @@ class CarlaGymEnv(gym.Env):
         if distance_to_center > 2.0:
             return -50.0, True
 
-        # 3. 密集型进度奖励
+        # 3. 密集型进度奖励 (【修改】将进步的奖励翻倍，重赏之下必有勇夫)
         wp_forward = waypoint.transform.get_forward_vector()
         v_progress = velocity.x * wp_forward.x + velocity.y * wp_forward.y
-        r_progress = 1.0 * (v_progress / 30.0)
+        r_progress = 2.0 * (v_progress / 30.0)  # 权重从 1.0 改为 2.0
         reward += r_progress
 
-        # 4. 速度奖励
+        # 4. 速度奖励 (保持不变)
         r_speed = 2.0 * (v_current / 15.0) if v_current <= 15.0 else 2.0
         reward += r_speed
 
         # ---------------------------------------------------------
-        # 5. 【核心修正】车道保持与消极怠工惩罚
+        # 5. 【核心修正】车道保持与消极怠工惩罚 (加入 3 秒免责期)
         # ---------------------------------------------------------
         r_lane = 1.0 * (1.0 - min(distance_to_center / 1.5, 1.0))
 
-        if v_progress < 1.0:
-            # 如果车辆前向投影速度低于 1 m/s (约 3.6 km/h)，视为原地怠工
-            r_lane = 0.0  # 熔断：剥夺车道保持奖励
-            reward -= 1.0  # 鞭策：每停滞一步，扣除 1.0 分
+        # 给 AI 前 60 步 (约 3 秒) 的起步发力时间，在此期间不判怠工！
+        if v_progress < 1.0 and self.current_step > 60:
+            r_lane = 0.0
+            reward -= 1.0
         else:
-            # 只有当车辆真正动起来时，才给予车道居中奖励
             reward += r_lane
         # ---------------------------------------------------------
 
