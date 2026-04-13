@@ -43,6 +43,9 @@ class CarlaGymEnv(gym.Env):
         self.max_steps = 2000  # 约 100 秒物理时间
         self.current_step = 0
 
+        # 【优化：新增】记录上一帧的方向盘动作，用于平滑性惩罚
+        self.prev_steer = 0.0
+
         # 4. 定义动作空间与状态空间
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
@@ -82,6 +85,12 @@ class CarlaGymEnv(gym.Env):
         # 4. 计算奖励与回合终止标志
         reward, terminated = self._get_reward()
 
+        # 【优化：新增】动作连续性惩罚 (Action Jerk Penalty)
+        # 严惩方向盘的一惊一乍，解决 10 万步时的 Bang-Bang Control (画龙)
+        steer_change_penalty = -1.0 * abs(steer - self.prev_steer)
+        reward += steer_change_penalty
+        self.prev_steer = steer  # 存入缓存供下一帧比较
+
         # 【新增】截断判定：达到最大步数上限则截断回合
         truncated = False
         if self.current_step >= self.max_steps:
@@ -99,11 +108,21 @@ class CarlaGymEnv(gym.Env):
         v_current = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
         ego_transform = self.ego_vehicle.get_transform()
         ego_location = ego_transform.location
-        waypoint = self.map.get_waypoint(ego_location)
 
-        wp_right = waypoint.transform.get_right_vector()
-        vector_to_wp = ego_location - waypoint.transform.location
-        distance_to_center = abs(vector_to_wp.x * wp_right.x + vector_to_wp.y * wp_right.y)
+        current_waypoint = self.map.get_waypoint(ego_location)
+
+        # 【优化：新增】往前预瞄 8 米的航向（Look-ahead Waypoint），提前感知弯道
+        next_waypoints = current_waypoint.next(8.0)
+        if next_waypoints:
+            target_waypoint = next_waypoints[0]
+        else:
+            target_waypoint = current_waypoint
+
+        # 计算与*当前*车道中心的横向偏差（判断是否出界需要根据当前位置）
+        current_wp_right = current_waypoint.transform.get_right_vector()
+        vector_to_current_wp = ego_location - current_waypoint.transform.location
+        distance_to_center = abs(
+            vector_to_current_wp.x * current_wp_right.x + vector_to_current_wp.y * current_wp_right.y)
 
         # ---------------- 1. 致命错误 ----------------
         if self.has_collided:
@@ -127,7 +146,8 @@ class CarlaGymEnv(gym.Env):
             self.stuck_steps = 0
 
         # ---------------- 3. 核心驱动力（防作弊版） ----------------
-        wp_forward = waypoint.transform.get_forward_vector()
+        # 投影速度依据预瞄点的前向向量
+        wp_forward = target_waypoint.transform.get_forward_vector()
         v_progress = velocity.x * wp_forward.x + velocity.y * wp_forward.y
         target_speed = 10.0
 
@@ -137,14 +157,17 @@ class CarlaGymEnv(gym.Env):
             safety_factor = 1.0 - min(distance_to_center / 2.0, 1.0)
             reward += base_progress_reward * safety_factor
 
-            # 【核心修改】把姿态奖励收束到前进状态下。原地不动则没有这些奖励！
+            # 【优化】利用预瞄点计算航向角，并改用 L2 抛物线惩罚
             ego_yaw = ego_transform.rotation.yaw
-            wp_yaw = waypoint.transform.rotation.yaw
+            wp_yaw = target_waypoint.transform.rotation.yaw
             yaw_diff = abs((ego_yaw - wp_yaw + 180) % 360 - 180)
-            r_heading = 0.5 * (1.0 - min(yaw_diff / 15.0, 1.0))
+
+            # 偏离越小梯度越平缓，减轻中心震荡
+            r_heading = 0.5 * (1.0 - (min(yaw_diff / 15.0, 1.0)) ** 2)
             reward += r_heading
 
-            r_lane = 0.5 * (1.0 - min(distance_to_center / 1.0, 1.0))
+            # 横向偏差同样改用 L2 抛物线惩罚
+            r_lane = 0.5 * (1.0 - (min(distance_to_center / 1.0, 1.0)) ** 2)
             reward += r_lane
 
         elif v_progress < -0.5:
@@ -168,9 +191,10 @@ class CarlaGymEnv(gym.Env):
         self._clear_actors()
         self.has_collided = False
 
-        # 【新增】重置当前步数
+        # 【新增】重置当前步数与防抖记录
         self.current_step = 0
         self.stuck_steps = 0
+        self.prev_steer = 0.0  # 【优化：重置】重置上一帧动作
 
         # 1. 随机选择生成点并生成自车 (Ego)
         ego_bp = random.choice(self.blueprint_library.filter('vehicle.tesla.model3'))
@@ -235,63 +259,54 @@ class CarlaGymEnv(gym.Env):
         if self.ego_vehicle is None:
             return np.zeros(7, dtype=np.float32)
 
-        # 获取自车状态
         ego_trans = self.ego_vehicle.get_transform()
         ego_loc = ego_trans.location
         ego_vel = self.ego_vehicle.get_velocity()
         ego_accel = self.ego_vehicle.get_acceleration()
 
-        # 1. 自车速度归一化 (假设最高限速 30m/s)
+        # 1. 自车速度
         v_ego_raw = math.sqrt(ego_vel.x ** 2 + ego_vel.y ** 2 + ego_vel.z ** 2)
         v_ego = np.clip(v_ego_raw / 30.0, 0.0, 1.0)
 
-        # 2. 自车纵向加速度归一化 (假设最大加速度为 8m/s^2)
+        # 2. 自车加速度
         ego_fwd = ego_trans.get_forward_vector()
-        a_ego_raw = (ego_accel.x * ego_fwd.x) + (ego_accel.y * ego_fwd.y)  # 点乘求前向加速度
+        a_ego_raw = (ego_accel.x * ego_fwd.x) + (ego_accel.y * ego_fwd.y)
         a_ego = np.clip(a_ego_raw / 8.0, -1.0, 1.0)
 
-        # 获取当前位置的地图 Waypoint，用于计算偏差
         carla_map = self.world.get_map()
-        waypoint = carla_map.get_waypoint(ego_loc)
+        current_waypoint = carla_map.get_waypoint(ego_loc)
 
-        # 3. 横向偏差归一化 (假设最大允许偏差 2.0m)
-        # 用自车位置与waypoint位置的距离近似
-        lat_dev_raw = ego_loc.distance(waypoint.transform.location)
-        lat_dev = np.clip(lat_dev_raw / 2.0, 0.0, 1.0)  # 简化为绝对偏差
+        # 3. 横向偏差归一化 (依然使用当前 waypoint 计算横向偏差)
+        lat_dev_raw = ego_loc.distance(current_waypoint.transform.location)
+        lat_dev = np.clip(lat_dev_raw / 2.0, 0.0, 1.0)
 
-        # 4. 航向角偏差归一化 (角度差值缩放到 [-1, 1])
+        # 【优化】4. 航向角偏差基于预瞄点提取，让网络策略提早知道前方有弯道
+        next_waypoints = current_waypoint.next(8.0)
+        target_waypoint = next_waypoints[0] if next_waypoints else current_waypoint
+
         ego_yaw = ego_trans.rotation.yaw
-        wp_yaw = waypoint.transform.rotation.yaw
-        yaw_diff = (ego_yaw - wp_yaw + 180) % 360 - 180  # 将角度差限制在 [-180, 180] 之间
-        heading_dev = np.clip(yaw_diff / 90.0, -1.0, 1.0)  # 假设超过 90 度就直接截断
+        wp_yaw = target_waypoint.transform.rotation.yaw
+        yaw_diff = (ego_yaw - wp_yaw + 180) % 360 - 180
+        heading_dev = np.clip(yaw_diff / 90.0, -1.0, 1.0)
 
         # --- 寻找前车并计算相对状态 ---
+        # ... 后面的相对距离、速度代码保持原样 ...
         target_npc = self._find_target_lead_vehicle(ego_trans)
-
         if target_npc:
-            # 存在前车
             npc_loc = target_npc.get_location()
             npc_vel = target_npc.get_velocity()
-
-            # 5. 前车相对距离归一化 (最大探测距离设为 50m)
             dist_raw = ego_loc.distance(npc_loc)
             delta_x = np.clip(dist_raw / 50.0, 0.0, 1.0)
-
-            # 6. 前车相对速度归一化 (NPC速度在自车前向的投影 - 自车速度)
             v_npc_fwd = math.sqrt(npc_vel.x ** 2 + npc_vel.y ** 2) * math.cos(
                 math.radians(target_npc.get_transform().rotation.yaw - ego_yaw))
             delta_v_raw = v_npc_fwd - v_ego_raw
             delta_v = np.clip(delta_v_raw / 30.0, -1.0, 1.0)
-
-            # 7. 前车制动信号
             brake_signal = 1.0 if target_npc.get_light_state() & carla.VehicleLightState.Brake else 0.0
         else:
-            # 前方无车，赋予安全默认值
-            delta_x = 1.0  # 距离最远 (安全)
-            delta_v = 0.0  # 相对速度为0
+            delta_x = 1.0
+            delta_v = 0.0
             brake_signal = 0.0
 
-        # 组合成 7 维向量
         obs = np.array([v_ego, a_ego, lat_dev, heading_dev, delta_x, delta_v, brake_signal], dtype=np.float32)
         return obs
 
