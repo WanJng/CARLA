@@ -108,23 +108,20 @@ class CarlaGymEnv(gym.Env):
         v_current = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
         ego_transform = self.ego_vehicle.get_transform()
         ego_location = ego_transform.location
+        ego_yaw = ego_transform.rotation.yaw
 
         current_waypoint = self.map.get_waypoint(ego_location)
 
-        # 【优化修改】动态预瞄机制：根据车速决定看多远
-        # 假设 0.5 秒的反应时间，最小看 3 米，最大看 10 米
+        # 获取预瞄点 (仅用于驱动进度计算，不用于姿态惩罚)
         lookahead_distance = np.clip(v_current * 0.5, 3.0, 10.0)
         next_waypoints = current_waypoint.next(lookahead_distance)
-        if next_waypoints:
-            target_waypoint = next_waypoints[0]
-        else:
-            target_waypoint = current_waypoint
+        target_waypoint = next_waypoints[0] if next_waypoints else current_waypoint
 
-        # 计算与*当前*车道中心的横向偏差（判断是否出界需要根据当前位置）
+        # 计算带符号的横向偏差和绝对距离
         current_wp_right = current_waypoint.transform.get_right_vector()
         vector_to_current_wp = ego_location - current_waypoint.transform.location
-        distance_to_center = abs(
-            vector_to_current_wp.x * current_wp_right.x + vector_to_current_wp.y * current_wp_right.y)
+        signed_lat_dev = vector_to_current_wp.x * current_wp_right.x + vector_to_current_wp.y * current_wp_right.y
+        distance_to_center = abs(signed_lat_dev)
 
         # ---------------- 1. 致命错误 ----------------
         if self.has_collided:
@@ -136,55 +133,44 @@ class CarlaGymEnv(gym.Env):
         if getattr(self, 'current_step', 0) > 50:
             if getattr(self, 'stuck_steps', None) is None:
                 self.stuck_steps = 0
-
             if v_current < 1.0:
                 self.stuck_steps += 1
             else:
                 self.stuck_steps = 0
-
             if self.stuck_steps > 30:
                 return -20.0, True
         else:
             self.stuck_steps = 0
 
-        # ---------------- 3. 核心驱动力（防作弊版） ----------------
-        # 投影速度依据预瞄点的前向向量
+        # ---------------- 3. 核心驱动力 ----------------
         wp_forward = target_waypoint.transform.get_forward_vector()
         v_progress = velocity.x * wp_forward.x + velocity.y * wp_forward.y
         target_speed = 10.0
 
         if v_progress > 0.5:
-            # 只有车子真正在往前开，才开始计分！
             base_progress_reward = 3.0 * min(v_progress / target_speed, 1.0)
             safety_factor = 1.0 - min(distance_to_center / 2.0, 1.0)
             reward += base_progress_reward * safety_factor
 
-            # 【优化】利用预瞄点计算航向角，并改用 L2 抛物线惩罚
-            ego_yaw = ego_transform.rotation.yaw
-            wp_yaw = target_waypoint.transform.rotation.yaw
-            yaw_diff = abs((ego_yaw - wp_yaw + 180) % 360 - 180)
-
-            # 偏离越小梯度越平缓，减轻中心震荡
-            r_heading = 0.5 * (1.0 - (min(yaw_diff / 15.0, 1.0)) ** 2)
+            # 【核心修复 3】：航向角惩罚必须和【当前】车道线对齐！
+            # 这样它在转弯前只会乖乖走在自己车道中心，而不会过早“切弯”
+            current_wp_yaw = current_waypoint.transform.rotation.yaw
+            current_yaw_diff = abs((ego_yaw - current_wp_yaw + 180) % 360 - 180)
+            r_heading = 0.5 * (1.0 - (min(current_yaw_diff / 15.0, 1.0)) ** 2)
             reward += r_heading
 
-            # 【优化修改】横向偏差改回线性！
-            # 只要不在绝对中心，就会受到稳定且明显的拉力，逼迫它微调方向盘
-            r_lane = 0.5 * (1.0 - min(distance_to_center / 1.0, 1.0))
+            # 强迫居中的线性拉力
+            r_lane = 1.0 * (1.0 - min(distance_to_center / 1.0, 1.0))
             reward += r_lane
 
         elif v_progress < -0.5:
-            # 严惩倒车
             reward -= 2.0
         else:
-            # 【新增】怠速/龟速状态，不仅没奖励，还要给微小的惩罚，逼它动起来
             reward -= 0.1
 
         # ---------------- 4. 舒适性惩罚 ----------------
-        # 无论动不动，只要乱打方向盘就扣分，防止它原地抽搐
-        angular_velocity = self.ego_vehicle.get_angular_velocity()
-        r_comfort = -0.5 * (abs(angular_velocity.z) / 5.0)
-        reward += r_comfort
+        # 【注意】我们直接移除角速度惩罚 (r_comfort)！
+        # 因为它会抑制正常的转向动作。既然已经有了平滑方向盘的 steer_change_penalty，就不需要这个了。
 
         return reward, terminated
 
@@ -266,6 +252,7 @@ class CarlaGymEnv(gym.Env):
         ego_loc = ego_trans.location
         ego_vel = self.ego_vehicle.get_velocity()
         ego_accel = self.ego_vehicle.get_acceleration()
+        ego_yaw = ego_trans.rotation.yaw
 
         # 1. 自车速度
         v_ego_raw = math.sqrt(ego_vel.x ** 2 + ego_vel.y ** 2 + ego_vel.z ** 2)
@@ -279,21 +266,26 @@ class CarlaGymEnv(gym.Env):
         carla_map = self.world.get_map()
         current_waypoint = carla_map.get_waypoint(ego_loc)
 
-        # 3. 横向偏差归一化 (依然使用当前 waypoint 计算横向偏差)
-        lat_dev_raw = ego_loc.distance(current_waypoint.transform.location)
-        lat_dev = np.clip(lat_dev_raw / 2.0, 0.0, 1.0)
+        # 【核心修复 1】：计算带有正负号的横向偏差 (Signed Cross-track Error)
+        # 这样模型才能知道自己是偏左了还是偏右了！
+        wp_right = current_waypoint.transform.get_right_vector()
+        vec_to_ego = ego_loc - current_waypoint.transform.location
+        signed_lat_dev = vec_to_ego.x * wp_right.x + vec_to_ego.y * wp_right.y
+        lat_dev = np.clip(signed_lat_dev / 2.0, -1.0, 1.0)  # 偏右为正，偏左为负
 
-        # 【优化】4. 航向角偏差基于预瞄点提取，让网络策略提早知道前方有弯道
-        next_waypoints = current_waypoint.next(8.0)
+        # 【核心修复 2】：使用纯追踪几何角 (Pure Pursuit Angle) 代替简单的 Yaw 差
+        lookahead_distance = np.clip(v_ego_raw * 0.5, 3.0, 10.0)
+        next_waypoints = current_waypoint.next(lookahead_distance)
         target_waypoint = next_waypoints[0] if next_waypoints else current_waypoint
 
-        ego_yaw = ego_trans.rotation.yaw
-        wp_yaw = target_waypoint.transform.rotation.yaw
-        yaw_diff = (ego_yaw - wp_yaw + 180) % 360 - 180
-        heading_dev = np.clip(yaw_diff / 90.0, -1.0, 1.0)
+        # 计算车身当前位置指向预瞄点的向量角度
+        vec_to_target = target_waypoint.transform.location - ego_loc
+        target_yaw = math.degrees(math.atan2(vec_to_target.y, vec_to_target.x))
+        # 这个角度差告诉模型：“前面的路在你的左前方还是右前方”
+        angle_diff = (target_yaw - ego_yaw + 180) % 360 - 180
+        heading_dev = np.clip(angle_diff / 90.0, -1.0, 1.0)
 
-        # --- 寻找前车并计算相对状态 ---
-        # ... 后面的相对距离、速度代码保持原样 ...
+        # --- 寻找前车并计算相对状态 (保持原样) ---
         target_npc = self._find_target_lead_vehicle(ego_trans)
         if target_npc:
             npc_loc = target_npc.get_location()

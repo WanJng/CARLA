@@ -3,7 +3,7 @@ import time
 
 
 def main():
-    recording_name = "ppo_final_eval_9.log"
+    recording_name = "ppo_final_eval_11.log"
     client = carla.Client('localhost', 2000)
     client.set_timeout(10.0)
 
