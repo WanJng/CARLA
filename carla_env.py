@@ -85,11 +85,11 @@ class CarlaGymEnv(gym.Env):
         # 4. 计算奖励与回合终止标志
         reward, terminated = self._get_reward()
 
-        # 【优化：新增】动作连续性惩罚 (Action Jerk Penalty)
-        # 严惩方向盘的一惊一乍，解决 10 万步时的 Bang-Bang Control (画龙)
-        steer_change_penalty = -1.0 * abs(steer - self.prev_steer)
+        # 【优化修改】大幅降低方向盘变化的惩罚权重，从 -1.0 降到 -0.1
+        # 让它敢于做微调，同时又能防画龙
+        steer_change_penalty = -0.1 * abs(steer - self.prev_steer)
         reward += steer_change_penalty
-        self.prev_steer = steer  # 存入缓存供下一帧比较
+        self.prev_steer = steer
 
         # 【新增】截断判定：达到最大步数上限则截断回合
         truncated = False
@@ -111,8 +111,10 @@ class CarlaGymEnv(gym.Env):
 
         current_waypoint = self.map.get_waypoint(ego_location)
 
-        # 【优化：新增】往前预瞄 8 米的航向（Look-ahead Waypoint），提前感知弯道
-        next_waypoints = current_waypoint.next(8.0)
+        # 【优化修改】动态预瞄机制：根据车速决定看多远
+        # 假设 0.5 秒的反应时间，最小看 3 米，最大看 10 米
+        lookahead_distance = np.clip(v_current * 0.5, 3.0, 10.0)
+        next_waypoints = current_waypoint.next(lookahead_distance)
         if next_waypoints:
             target_waypoint = next_waypoints[0]
         else:
@@ -166,8 +168,9 @@ class CarlaGymEnv(gym.Env):
             r_heading = 0.5 * (1.0 - (min(yaw_diff / 15.0, 1.0)) ** 2)
             reward += r_heading
 
-            # 横向偏差同样改用 L2 抛物线惩罚
-            r_lane = 0.5 * (1.0 - (min(distance_to_center / 1.0, 1.0)) ** 2)
+            # 【优化修改】横向偏差改回线性！
+            # 只要不在绝对中心，就会受到稳定且明显的拉力，逼迫它微调方向盘
+            r_lane = 0.5 * (1.0 - min(distance_to_center / 1.0, 1.0))
             reward += r_lane
 
         elif v_progress < -0.5:
