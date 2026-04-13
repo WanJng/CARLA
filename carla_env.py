@@ -168,9 +168,23 @@ class CarlaGymEnv(gym.Env):
         else:
             reward -= 0.1
 
-        # ---------------- 4. 舒适性惩罚 ----------------
-        # 【注意】我们直接移除角速度惩罚 (r_comfort)！
-        # 因为它会抑制正常的转向动作。既然已经有了平滑方向盘的 steer_change_penalty，就不需要这个了。
+        # ---------------- 4. 舒适性与动作惩罚 (替换这部分) ----------------
+
+        # 1. 保留原本的跳变惩罚（防抽搐）
+        steer = self.ego_vehicle.get_control().steer
+        # 注意：这里需要在 step 函数中把当前的 steer 传进来，或者直接获取控制状态
+
+        # 2. 【核心新增】绝对转向角度平方惩罚 (L2 Steering Penalty)
+        # 强迫网络：非必要不打大方向！
+        # steer^2 使得微调(0.1)几乎无惩罚，但打死(1.0)会有极大的惩罚
+        steer_magnitude_penalty = -0.5 * (steer ** 2)
+        reward += steer_magnitude_penalty
+
+        # 3. 【核心新增】高速大转向惩罚 (Speed-Steering Coupling)
+        # 解决直角弯前，速度还很快就猛打方向盘导致切弯撞墙的问题
+        if v_current > 5.0 and abs(steer) > 0.5:
+            # 车速大于5m/s（约18km/h）时，如果方向盘打超过一半，给予额外重罚
+            reward -= 1.0
 
         return reward, terminated
 
