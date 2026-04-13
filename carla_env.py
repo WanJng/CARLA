@@ -45,6 +45,8 @@ class CarlaGymEnv(gym.Env):
 
         # 【优化：新增】记录上一帧的方向盘动作，用于平滑性惩罚
         self.prev_steer = 0.0
+        # 【新增】记录上一帧的油门/刹车动作，用于纵向平滑性惩罚
+        self.prev_throttle_brake = 0.0
 
         # 4. 定义动作空间与状态空间
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
@@ -91,14 +93,14 @@ class CarlaGymEnv(gym.Env):
         reward += steer_change_penalty
         self.prev_steer = steer
 
-        # 【新增】截断判定：达到最大步数上限则截断回合
-        truncated = False
-        if self.current_step >= self.max_steps:
-            truncated = True
+        # 2. 【新增】油门/刹车变化的惩罚 (纵向舒适性 - 防急刹/急加速)
+        # 权重设为 -0.1，允许平滑收放油门，但严惩 1.0 直接切到 -1.0
+        throttle_change_penalty = -0.1 * abs(throttle_brake - self.prev_throttle_brake)
+        reward += throttle_change_penalty
+        self.prev_throttle_brake = throttle_brake
 
-        info = {}
-
-        return obs, reward, terminated, truncated, info
+        truncated = self.current_step >= self.max_steps
+        return obs, reward, terminated, truncated, {}
 
     def _get_reward(self):
         reward = 0.0
@@ -163,6 +165,12 @@ class CarlaGymEnv(gym.Env):
             r_lane = 1.0 * (1.0 - min(distance_to_center / 1.0, 1.0))
             reward += r_lane
 
+            # 【新增核心】严格的超速惩罚！
+            # 如果当前绝对车速超过 target_speed，超得越多，扣分越狠
+            if v_current > target_speed:
+                speeding_penalty = -0.5 * (v_current - target_speed)
+                reward += speeding_penalty
+
         elif v_progress < -0.5:
             reward -= 2.0
         else:
@@ -198,6 +206,7 @@ class CarlaGymEnv(gym.Env):
         self.current_step = 0
         self.stuck_steps = 0
         self.prev_steer = 0.0  # 【优化：重置】重置上一帧动作
+        self.prev_throttle_brake = 0.0  # 【重置】
 
         # 1. 随机选择生成点并生成自车 (Ego)
         ego_bp = random.choice(self.blueprint_library.filter('vehicle.tesla.model3'))
