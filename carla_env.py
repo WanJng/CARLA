@@ -6,16 +6,16 @@ import math
 import random
 import time
 
+
 class CarlaGymEnv(gym.Env):
     """
-    纯向量化的 CARLA 强化学习环境
-    专为低显存、高并发训练设计
+    高级 CARLA 强化学习环境 (支持交规、交通流、行人与平顺控制)
     """
 
     def __init__(self):
         super(CarlaGymEnv, self).__init__()
 
-        # 1. 连接 CARLA 服务端
+        # 1. 连接 CARLA 服务端与交通管理器 (Traffic Manager)
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)
 
@@ -23,7 +23,14 @@ class CarlaGymEnv(gym.Env):
         if not self.world.get_map().name.endswith('Town01'):
             print("正在加载 Town01 地图...")
             self.world = self.client.load_world('Town01')
+
+        # 设置 Traffic Manager
+        self.tm = self.client.get_trafficmanager(8000)
+        self.tm.set_synchronous_mode(True)
+        self.tm.global_percentage_speed_difference(10.0)  # 让 NPC 开慢点，模拟城市路况
+
         self._clear_all_zombies()
+
         # 2. 开启同步模式与固定时间步长
         settings = self.world.get_settings()
         settings.synchronous_mode = True
@@ -35,22 +42,24 @@ class CarlaGymEnv(gym.Env):
 
         # 3. 实体追踪器与传感器状态
         self.ego_vehicle = None
-        self.npc_vehicle = None
         self.collision_sensor = None
         self.has_collided = False
+        self.npc_list = []  # 记录生成的 NPC 车辆和行人，方便回收
 
-        # 【新增】回合步数控制
-        self.max_steps = 2000  # 约 100 秒物理时间
+        # 回合步数与平顺性记录
+        self.max_steps = 2000
         self.current_step = 0
+        self.stuck_steps = 0
 
-        # 【优化：新增】记录上一帧的方向盘动作，用于平滑性惩罚
         self.prev_steer = 0.0
-        # 【新增】记录上一帧的油门/刹车动作，用于纵向平滑性惩罚
         self.prev_throttle_brake = 0.0
 
-        # 4. 定义动作空间与状态空间
+        # 4. 定义动作空间与【全新 10 维状态空间】
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
+
+        # Obs: [v_ego, a_ego, lat_dev, heading_dev, hazard_dist, hazard_v, hazard_brake, tl_state, tl_dist, hazard_type]
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(10,), dtype=np.float32)
+
 
     def start_recording(self, filename):
         """【新增】开启 CARLA 官方录制器，记录所有 Actor 轨迹"""
@@ -65,7 +74,6 @@ class CarlaGymEnv(gym.Env):
 
     def step(self, action):
         """核心步进函数：打通强化学习的 MDP 闭环"""
-        # 【新增】步数累加
         self.current_step += 1
 
         # 1. 解析解耦后的动作
@@ -81,28 +89,29 @@ class CarlaGymEnv(gym.Env):
         # 2. 使用同步推进
         self.world.tick()
 
-        # 3. 获取新状态
+        # 3. 获取新状态 (传入 obs 以便后续提取交规信息)
         obs = self._get_observation()
 
         # 4. 计算奖励与回合终止标志
-        reward, terminated = self._get_reward()
+        reward, terminated = self._get_reward(obs)
 
-        # 【优化修改】大幅降低方向盘变化的惩罚权重，从 -1.0 降到 -0.1
-        # 让它敢于做微调，同时又能防画龙
-        steer_change_penalty = -0.1 * abs(steer - self.prev_steer)
+        # ---------------- 【必要优化：L2 二次方平顺性惩罚】 ----------------
+        # 方向盘防抖 (严惩出弯甩尾和暴力反打，权重调高至 -2.5)
+        steer_change_penalty = -1 * ((steer - self.prev_steer) ** 2)
         reward += steer_change_penalty
         self.prev_steer = steer
 
-        # 2. 【新增】油门/刹车变化的惩罚 (纵向舒适性 - 防急刹/急加速)
+        # 踏板防抖 (严惩满油门瞬间接满刹车)
         # 权重设为 -0.1，允许平滑收放油门，但严惩 1.0 直接切到 -1.0
         throttle_change_penalty = -0.1 * abs(throttle_brake - self.prev_throttle_brake)
         reward += throttle_change_penalty
         self.prev_throttle_brake = throttle_brake
+        # -----------------------------------------------------------------
 
         truncated = self.current_step >= self.max_steps
         return obs, reward, terminated, truncated, {}
 
-    def _get_reward(self):
+    def _get_reward(self, obs):  # 注意这里增加了 obs 参数
         reward = 0.0
         terminated = False
 
@@ -125,26 +134,45 @@ class CarlaGymEnv(gym.Env):
         signed_lat_dev = vector_to_current_wp.x * current_wp_right.x + vector_to_current_wp.y * current_wp_right.y
         distance_to_center = abs(signed_lat_dev)
 
+        # --- 【必要新增】：从 Obs 中提取交规与障碍物信息 ---
+        hazard_dist_norm = obs[4]
+        tl_state = obs[7]
+        tl_dist_norm = obs[8]
+
+        is_red_light = (tl_state > 0.5)
+        is_near_intersection = (tl_dist_norm < 0.2)  # 距离路口约 10 米内
+        hazard_is_close = (hazard_dist_norm < 0.2)  # 距离障碍物约 10 米内
+
         # ---------------- 1. 致命错误 ----------------
         if self.has_collided:
             return -200.0, True
         if distance_to_center > 2.0:
             return -200.0, True
 
-        # ---------------- 2. 僵死熔断 ----------------
-        if getattr(self, 'current_step', 0) > 50:
-            if getattr(self, 'stuck_steps', None) is None:
+        # 【必要新增】：闯红灯致死逻辑
+        if is_red_light and is_near_intersection and v_current > 2.5:
+            # 红灯跟前还保持高车速，视为闯红灯，直接重罚并结束
+            return -200.0, True
+
+        # ---------------- 2. 僵死熔断与智慧停车 ----------------
+        if v_current < 0.5:
+            if is_red_light or hazard_is_close:
+                # 【必要新增】：合法停车（等红灯/避让行人），给正向奖励并重置僵死状态
+                reward += 1.0
                 self.stuck_steps = 0
-            if v_current < 1.0:
-                self.stuck_steps += 1
             else:
-                self.stuck_steps = 0
-            if self.stuck_steps > 30:
-                return -20.0, True
+                # 原有的无故怠速惩罚逻辑保持不变
+                if getattr(self, 'current_step', 0) > 50:
+                    if getattr(self, 'stuck_steps', None) is None:
+                        self.stuck_steps = 0
+                    self.stuck_steps += 1
+                    reward -= 0.1
+                    if self.stuck_steps > 30:
+                        return -20.0, True
         else:
             self.stuck_steps = 0
 
-        # ---------------- 3. 核心驱动力 ----------------
+        # ---------------- 3. 核心驱动力 (原封不动) ----------------
         wp_forward = target_waypoint.transform.get_forward_vector()
         v_progress = velocity.x * wp_forward.x + velocity.y * wp_forward.y
         target_speed = 10.0
@@ -154,44 +182,31 @@ class CarlaGymEnv(gym.Env):
             safety_factor = 1.0 - min(distance_to_center / 2.0, 1.0)
             reward += base_progress_reward * safety_factor
 
-            # 【核心修复 3】：航向角惩罚必须和【当前】车道线对齐！
-            # 这样它在转弯前只会乖乖走在自己车道中心，而不会过早“切弯”
+            # 原封不动的极其成功的姿态对齐奖励
             current_wp_yaw = current_waypoint.transform.rotation.yaw
             current_yaw_diff = abs((ego_yaw - current_wp_yaw + 180) % 360 - 180)
             r_heading = 0.5 * (1.0 - (min(current_yaw_diff / 15.0, 1.0)) ** 2)
             reward += r_heading
 
-            # 强迫居中的线性拉力
             r_lane = 1.0 * (1.0 - min(distance_to_center / 1.0, 1.0))
             reward += r_lane
 
-            # 【新增核心】严格的超速惩罚！
-            # 如果当前绝对车速超过 target_speed，超得越多，扣分越狠
+            # 【必要新增】：严格的超速惩罚 (治好地板油)
             if v_current > target_speed:
                 speeding_penalty = -0.5 * (v_current - target_speed)
                 reward += speeding_penalty
 
         elif v_progress < -0.5:
             reward -= 2.0
-        else:
-            reward -= 0.1
+        # 无故怠速的扣分在前面处理过了
 
-        # ---------------- 4. 舒适性与动作惩罚 (替换这部分) ----------------
-
-        # 1. 保留原本的跳变惩罚（防抽搐）
+        # ---------------- 4. 绝对控制幅度惩罚 (原封不动) ----------------
         steer = self.ego_vehicle.get_control().steer
-        # 注意：这里需要在 step 函数中把当前的 steer 传进来，或者直接获取控制状态
 
-        # 2. 【核心新增】绝对转向角度平方惩罚 (L2 Steering Penalty)
-        # 强迫网络：非必要不打大方向！
-        # steer^2 使得微调(0.1)几乎无惩罚，但打死(1.0)会有极大的惩罚
         steer_magnitude_penalty = -0.5 * (steer ** 2)
         reward += steer_magnitude_penalty
 
-        # 3. 【核心新增】高速大转向惩罚 (Speed-Steering Coupling)
-        # 解决直角弯前，速度还很快就猛打方向盘导致切弯撞墙的问题
         if v_current > 5.0 and abs(steer) > 0.5:
-            # 车速大于5m/s（约18km/h）时，如果方向盘打超过一半，给予额外重罚
             reward -= 1.0
 
         return reward, terminated
@@ -218,35 +233,13 @@ class CarlaGymEnv(gym.Env):
         if self.ego_vehicle is None:
             return self.reset()
 
+        self._spawn_background_traffic()
+
         # 2. 给自车挂载碰撞传感器
         collision_bp = self.blueprint_library.find('sensor.other.collision')
         self.collision_sensor = self.world.try_spawn_actor(
             collision_bp, carla.Transform(), attach_to=self.ego_vehicle)
         self.collision_sensor.listen(lambda event: self._on_collision(event))
-
-        # 3. 计算自车正前方 20 米的坐标，生成 NPC
-        npc_bp = random.choice(self.blueprint_library.filter('vehicle.audi.a2'))
-        ego_transform = self.ego_vehicle.get_transform()
-        forward_vector = ego_transform.get_forward_vector()
-
-        npc_spawn_transform = carla.Transform(
-            carla.Location(
-                x=ego_transform.location.x + forward_vector.x * 20.0,
-                y=ego_transform.location.y + forward_vector.y * 20.0,
-                z=ego_transform.location.z + 0.5
-            ),
-            ego_transform.rotation
-        )
-
-        self.npc_vehicle = self.world.try_spawn_actor(npc_bp, npc_spawn_transform)
-
-        if self.npc_vehicle is None:
-            return self.reset()
-
-        # 4. 赋予 NPC 初始行为：匀速车
-        self.npc_vehicle.set_autopilot(False)
-        npc_control = carla.VehicleControl(throttle=0.4, steer=0.0, brake=0.0)
-        self.npc_vehicle.apply_control(npc_control)
 
         # 5. 同步模式下等待物理引擎稳定
         for _ in range(5):
@@ -258,30 +251,19 @@ class CarlaGymEnv(gym.Env):
         return obs, info
 
     def _get_observation(self):
-        """
-        提取并归一化 7 维纯物理向量
-        1. 自车速度 [0, 1]
-        2. 自车加速度 [-1, 1]
-        3. 横向偏差 [-1, 1]
-        4. 航向角偏差 [-1, 1]
-        5. 前车相对距离 [0, 1]
-        6. 前车相对速度 [-1, 1]
-        7. 前车制动信号 [0, 1]
-        """
+        """提取 10 维交规与环境感知向量"""
         if self.ego_vehicle is None:
-            return np.zeros(7, dtype=np.float32)
+            return np.zeros(10, dtype=np.float32)
 
         ego_trans = self.ego_vehicle.get_transform()
         ego_loc = ego_trans.location
         ego_vel = self.ego_vehicle.get_velocity()
-        ego_accel = self.ego_vehicle.get_acceleration()
         ego_yaw = ego_trans.rotation.yaw
 
-        # 1. 自车速度
         v_ego_raw = math.sqrt(ego_vel.x ** 2 + ego_vel.y ** 2 + ego_vel.z ** 2)
         v_ego = np.clip(v_ego_raw / 30.0, 0.0, 1.0)
 
-        # 2. 自车加速度
+        ego_accel = self.ego_vehicle.get_acceleration()
         ego_fwd = ego_trans.get_forward_vector()
         a_ego_raw = (ego_accel.x * ego_fwd.x) + (ego_accel.y * ego_fwd.y)
         a_ego = np.clip(a_ego_raw / 8.0, -1.0, 1.0)
@@ -289,85 +271,124 @@ class CarlaGymEnv(gym.Env):
         carla_map = self.world.get_map()
         current_waypoint = carla_map.get_waypoint(ego_loc)
 
-        # 【核心修复 1】：计算带有正负号的横向偏差 (Signed Cross-track Error)
-        # 这样模型才能知道自己是偏左了还是偏右了！
+        # 3. 带符号横向偏差
         wp_right = current_waypoint.transform.get_right_vector()
         vec_to_ego = ego_loc - current_waypoint.transform.location
         signed_lat_dev = vec_to_ego.x * wp_right.x + vec_to_ego.y * wp_right.y
-        lat_dev = np.clip(signed_lat_dev / 2.0, -1.0, 1.0)  # 偏右为正，偏左为负
+        lat_dev = np.clip(signed_lat_dev / 2.0, -1.0, 1.0)
 
-        # 【核心修复 2】：使用纯追踪几何角 (Pure Pursuit Angle) 代替简单的 Yaw 差
+        # 4. Pure Pursuit 预瞄角
         lookahead_distance = np.clip(v_ego_raw * 0.5, 3.0, 10.0)
         next_waypoints = current_waypoint.next(lookahead_distance)
         target_waypoint = next_waypoints[0] if next_waypoints else current_waypoint
-
-        # 计算车身当前位置指向预瞄点的向量角度
         vec_to_target = target_waypoint.transform.location - ego_loc
         target_yaw = math.degrees(math.atan2(vec_to_target.y, vec_to_target.x))
-        # 这个角度差告诉模型：“前面的路在你的左前方还是右前方”
         angle_diff = (target_yaw - ego_yaw + 180) % 360 - 180
         heading_dev = np.clip(angle_diff / 90.0, -1.0, 1.0)
 
-        # --- 寻找前车并计算相对状态 (保持原样) ---
-        target_npc = self._find_target_lead_vehicle(ego_trans)
-        if target_npc:
-            npc_loc = target_npc.get_location()
-            npc_vel = target_npc.get_velocity()
-            dist_raw = ego_loc.distance(npc_loc)
-            delta_x = np.clip(dist_raw / 50.0, 0.0, 1.0)
-            v_npc_fwd = math.sqrt(npc_vel.x ** 2 + npc_vel.y ** 2) * math.cos(
-                math.radians(target_npc.get_transform().rotation.yaw - ego_yaw))
-            delta_v_raw = v_npc_fwd - v_ego_raw
-            delta_v = np.clip(delta_v_raw / 30.0, -1.0, 1.0)
-            brake_signal = 1.0 if target_npc.get_light_state() & carla.VehicleLightState.Brake else 0.0
-        else:
-            delta_x = 1.0
-            delta_v = 0.0
-            brake_signal = 0.0
+        # ---------------- 【全新感知：交通灯】 ----------------
+        tl_state = 0.0
+        tl_dist = 1.0
+        if self.ego_vehicle.is_at_traffic_light():
+            tl = self.ego_vehicle.get_traffic_light()
+            if tl and tl.get_state() in [carla.TrafficLightState.Red, carla.TrafficLightState.Yellow]:
+                tl_state = 1.0  # 前方是红灯或黄灯
+                # 计算与红绿灯的距离
+                dist_raw = ego_loc.distance(tl.get_location())
+                tl_dist = np.clip(dist_raw / 50.0, 0.0, 1.0)
 
-        obs = np.array([v_ego, a_ego, lat_dev, heading_dev, delta_x, delta_v, brake_signal], dtype=np.float32)
+        # ---------------- 【全新感知：全类型危险物 (车/人)】 ----------------
+        target_hazard, hazard_type_val = self._find_nearest_hazard(ego_trans)
+        if target_hazard:
+            hz_loc = target_hazard.get_location()
+            hz_vel = target_hazard.get_velocity()
+            dist_raw = ego_loc.distance(hz_loc)
+            hazard_dist = np.clip(dist_raw / 50.0, 0.0, 1.0)
+
+            v_hz_fwd = math.sqrt(hz_vel.x ** 2 + hz_vel.y ** 2) * math.cos(
+                math.radians(target_hazard.get_transform().rotation.yaw - ego_yaw))
+            delta_v_raw = v_hz_fwd - v_ego_raw
+            hazard_v = np.clip(delta_v_raw / 30.0, -1.0, 1.0)
+
+            # 判断是否踩刹车 (行人默认不发刹车信号，设为0)
+            if hasattr(target_hazard, 'get_light_state') and (
+                    target_hazard.get_light_state() & carla.VehicleLightState.Brake):
+                hazard_brake = 1.0
+            else:
+                hazard_brake = 0.0
+        else:
+            hazard_dist = 1.0
+            hazard_v = 0.0
+            hazard_brake = 0.0
+            hazard_type_val = 0.0  # 0=无危险, 0.5=车辆, 1.0=行人
+
+        # 组合 10 维向量
+        obs = np.array([v_ego, a_ego, lat_dev, heading_dev, hazard_dist, hazard_v, hazard_brake, tl_state, tl_dist,
+                        hazard_type_val], dtype=np.float32)
         return obs
 
-    def _find_target_lead_vehicle(self, ego_trans, max_distance=50.0, lane_width_threshold=1.5):
-        """
-        利用向量点乘筛选同车道正前方的最近车辆
-        """
+    def _find_nearest_hazard(self, ego_trans, max_distance=50.0):
+        """寻找前方最近的危险源 (不仅找车，还要找人)"""
         ego_loc = ego_trans.location
         ego_fwd = ego_trans.get_forward_vector()
         ego_right = ego_trans.get_right_vector()
 
-        vehicles = self.world.get_actors().filter('vehicle.*')
-
         closest_dist = float('inf')
-        target_vehicle = None
+        target_hazard = None
+        hazard_type = 0.0  # 0.5 车辆, 1.0 行人
 
-        for npc in vehicles:
-            if npc.id == self.ego_vehicle.id:
+        # 合并遍历车辆和行人
+        all_hazards = self.world.get_actors().filter('*vehicle*')
+        walkers = self.world.get_actors().filter('*walker*')
+
+        hazards_to_check = list(all_hazards) + list(walkers)
+
+        for hz in hazards_to_check:
+            if hz.id == self.ego_vehicle.id:
                 continue
 
-            npc_loc = npc.get_location()
+            hz_loc = hz.get_location()
+            vec_rel_x = hz_loc.x - ego_loc.x
+            vec_rel_y = hz_loc.y - ego_loc.y
 
-            # 相对位移向量
-            vec_rel_x = npc_loc.x - ego_loc.x
-            vec_rel_y = npc_loc.y - ego_loc.y
-
-            # 投影到自车前向向量 (纵向距离)
             dx = vec_rel_x * ego_fwd.x + vec_rel_y * ego_fwd.y
-
-            # 投影到自车右向向量 (横向距离)
             dy = vec_rel_x * ego_right.x + vec_rel_y * ego_right.y
 
-            # 筛选条件：在前方 (dx > 0) 且在探测范围内，且在同一车道内 (|dy| < threshold)
-            if 0 < dx < max_distance and abs(dy) < lane_width_threshold:
+            # 筛选：在前方，在探测距离内，且在同一车道/斑马线宽度内 (|dy| < 2.5米 容忍度设宽点以保护行人)
+            if 0 < dx < max_distance and abs(dy) < 2.5:
                 if dx < closest_dist:
                     closest_dist = dx
-                    target_vehicle = npc
+                    target_hazard = hz
+                    hazard_type = 1.0 if 'walker' in hz.type_id else 0.5
 
-        return target_vehicle
+        return target_hazard, hazard_type
+
+    def _spawn_background_traffic(self, num_vehicles=15, num_walkers=10):
+        """利用 Traffic Manager 生成服从交规的交通流"""
+        spawn_points = self.map.get_spawn_points()
+        random.shuffle(spawn_points)
+
+        # 1. 生成 NPC 车辆
+        v_bps = self.blueprint_library.filter('vehicle.*')
+        for i in range(min(num_vehicles, len(spawn_points))):
+            bp = random.choice(v_bps)
+            npc = self.world.try_spawn_actor(bp, spawn_points[i])
+            if npc is not None:
+                npc.set_autopilot(True, self.tm.get_port())
+                self.npc_list.append(npc)
+
+        # 2. 生成行人 (随机散布在人行道上)
+        w_bps = self.blueprint_library.filter('walker.pedestrian.*')
+        for _ in range(num_walkers):
+            spawn_loc = self.world.get_random_location_from_navigation()
+            if spawn_loc is not None:
+                bp = random.choice(w_bps)
+                walker = self.world.try_spawn_actor(bp, carla.Transform(spawn_loc))
+                if walker is not None:
+                    self.npc_list.append(walker)
 
     def _clear_actors(self):
-        """严谨的资源回收机制，防止显存泄漏"""
-        # 新增：优先销毁传感器
+        """严格的资源回收机制"""
         if self.collision_sensor is not None:
             self.collision_sensor.stop()
             self.collision_sensor.destroy()
@@ -377,33 +398,25 @@ class CarlaGymEnv(gym.Env):
             self.ego_vehicle.destroy()
             self.ego_vehicle = None
 
-        if self.npc_vehicle is not None:
-            self.npc_vehicle.destroy()
-            self.npc_vehicle = None
+        # 销毁通过 TM 生成的 NPC
+        for npc in self.npc_list:
+            if npc.is_alive:
+                npc.destroy()
+        self.npc_list.clear()
 
     def _clear_all_zombies(self):
         """无差别全局大扫除"""
         print("正在清理世界中的残留实体...")
-        # 销毁所有残留车辆
-        vehicles = self.world.get_actors().filter('*vehicle*')
-        for v in vehicles:
-            v.destroy()
-        # 销毁所有残留传感器
-        sensors = self.world.get_actors().filter('*sensor*')
-        for s in sensors:
-            s.destroy()
+        for actor_type in ['*vehicle*', '*sensor*', '*walker*']:
+            actors = self.world.get_actors().filter(actor_type)
+            for a in actors:
+                a.destroy()
 
     def _on_collision(self, event):
-        """碰撞传感器回调函数"""
         self.has_collided = True
 
     def close(self):
-        """
-        关闭环境时的清理工作
-        """
         self._clear_actors()
-
-        # 退出时恢复异步模式，防止 CARLA 服务端假死
         try:
             settings = self.world.get_settings()
             settings.synchronous_mode = False
