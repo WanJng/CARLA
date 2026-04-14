@@ -40,10 +40,10 @@ def main():
     )
 
     # 5. 正式启动训练
-    # 目标：500,000 步。
-    print("开始 PPO 基准训练 (目标: 500,000 步)...")
+    # 目标：1,000,000 步。
+    print("开始 PPO 基准训练 (目标: 1,000,000 步)...")
     model.learn(
-        total_timesteps=500000,
+        total_timesteps=1000000,
         callback=checkpoint_callback,
         tb_log_name="PPO_run_1",
         progress_bar=True  # 在终端显示进度条
