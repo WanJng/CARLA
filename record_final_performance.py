@@ -6,8 +6,8 @@ from carla_env import CarlaGymEnv  # 确保当前目录下有之前的 carla_env
 
 def record():
     # 1. 配置文件路径
-    model_path = "./models/ppo_baseline/ppo_carla_model_500000_steps.zip"
-    recording_name = "ppo_final_eval_17.log"
+    model_path = "./models/ppo_baseline/ppo_carla_final.zip.zip"
+    recording_name = "ppo_final_eval_20.log"
 
     if not os.path.exists(model_path):
         print(f"错误：找不到模型文件 {model_path}")

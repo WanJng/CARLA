@@ -79,7 +79,8 @@ class CarlaGymEnv(gym.Env):
         reward += steer_change_penalty
         self.prev_steer = steer
 
-        throttle_change_penalty = -0.1 * abs(throttle_brake - self.prev_throttle_brake)
+        # 对油门/刹车的急剧变化施加更严厉的二次方惩罚
+        throttle_change_penalty = -0.2 * abs(throttle_brake - self.prev_throttle_brake)
         reward += throttle_change_penalty
         self.prev_throttle_brake = throttle_brake
 
@@ -107,6 +108,8 @@ class CarlaGymEnv(gym.Env):
         distance_to_center = abs(signed_lat_dev)
 
         hazard_dist_norm = obs[4]
+        hazard_v = obs[5]
+        hazard_brake = obs[6]
         tl_state = obs[7]
         tl_dist_norm = obs[8]
 
@@ -116,10 +119,10 @@ class CarlaGymEnv(gym.Env):
 
         # 1. 致命错误
         if self.has_collided or distance_to_center > 2.0:
-            return -200.0, True
+            return -500.0, True
 
         if is_red_light and is_near_intersection and v_current > 2.5:
-            return -200.0, True
+            return -500.0, True
 
         # 2. 僵死熔断与智慧停车
         if v_current < 0.5:
@@ -128,7 +131,7 @@ class CarlaGymEnv(gym.Env):
             else:
                 if self.current_step > 50:
                     self.stuck_steps += 1
-                    reward -= 0.1
+                    reward -= 1.0
                     if self.stuck_steps > 100:
                         return -20.0, True
         else:
@@ -139,7 +142,7 @@ class CarlaGymEnv(gym.Env):
         v_progress = velocity.x * wp_forward.x + velocity.y * wp_forward.y
         target_speed = 10.0
 
-        if v_progress > 0.5:
+        if v_progress > 0.1:
             base_progress_reward = 3.0 * min(v_progress / target_speed, 1.0)
             safety_factor = 1.0 - min(distance_to_center / 2.0, 1.0)
             reward += base_progress_reward * safety_factor
@@ -157,6 +160,40 @@ class CarlaGymEnv(gym.Env):
 
         elif v_progress < -0.5:
             reward -= 2.0
+
+        # ====== 获取真实距离与速度 ======
+        # 将归一化的特征还原为物理量，便于设定直观的阈值
+        hazard_dist_real = hazard_dist_norm * 50.0
+        v_hz_relative = hazard_v * 30.0  # 相对速度（负值代表障碍物比我们慢，或者正在向我们靠近）
+
+        # ====== 1. 定义动态安全距离 ======
+        # 核心公式：动态安全距离 = 最小静止间距 + (自车速度 * 期望反应时距)
+        # 例如：最小距离 2.5米，期望反应时间 1.5秒
+        desired_safe_distance = 2.5 + v_current * 1.5
+
+        # ====== 2. 纵向危险惩罚 (跟车与逼近) ======
+        if hazard_dist_real < 50.0:  # 如果前方 50 米内有障碍物
+
+            # 2.1 侵入安全距离惩罚 (连续惩罚)
+            if hazard_dist_real < desired_safe_distance:
+                # 计算侵入程度 (0 到 1)，越近越危险
+                intrusion_ratio = 1.0 - (hazard_dist_real / desired_safe_distance)
+                # 施加二次方惩罚，贴得越近，惩罚呈指数级上升
+                reward -= 2.0 * (intrusion_ratio ** 2)
+
+            # 2.2 追尾高危预警 (TTC 惩罚)
+            # 如果对方比我们慢，且我们距离很近，说明正在快速逼近
+            if v_hz_relative < -1.0 and hazard_dist_real < 15.0:
+                ttc = hazard_dist_real / abs(v_hz_relative)  # 预计碰撞时间 (Time to Collision)
+                if ttc < 2.0:  # 如果预计 2 秒内会撞上
+                    reward -= 3.0  # 重度扣分，逼迫智能体立刻踩刹车
+
+            # 2.3 前车刹车联动惩罚
+            if hazard_brake > 0.5 and hazard_dist_real < 20.0:
+                # 如果前车亮起刹车灯，且距离在 20 米内，但自车没踩刹车甚至还在踩油门
+                throttle_brake = self.ego_vehicle.get_control().throttle - self.ego_vehicle.get_control().brake
+                if throttle_brake > -0.5:
+                    reward -= 1.0  # 惩罚这种不安全的跟车习惯
 
         # 4. 绝对控制幅度惩罚
         steer = self.ego_vehicle.get_control().steer
@@ -319,7 +356,9 @@ class CarlaGymEnv(gym.Env):
 
                 # 【核心改造：时空交汇预测】
                 # 计算自车到达这个轨迹点大约需要多少时间
-                time_to_reach = path_dist / v_ego_raw
+                # 假设如果自车静止起步，预期也会以至少 3.0 m/s 的速度经过该路段
+                v_ego_projected = max(v_ego_raw, 3.0)
+                time_to_reach = path_dist / v_ego_projected
 
                 # 预测在那个时间点，障碍物会走到哪里 (简单的匀速直线预测)
                 predicted_hz_x = hz_loc.x + hz_vel.x * time_to_reach
@@ -396,6 +435,19 @@ class CarlaGymEnv(gym.Env):
                 a.destroy()
 
     def _on_collision(self, event):
+        actor_type = event.other_actor.type_id
+
+        # 1. 过滤与路面、人行道的底盘物理摩擦
+        if 'road' in actor_type or 'sidewalk' in actor_type:
+            return
+
+        # 2. 过滤掉极轻微的刮擦或 NPC 在低速时的追尾 (计算碰撞冲量强度)
+        impulse = event.normal_impulse
+        intensity = math.sqrt(impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2)
+
+        if intensity < 200.0:  # 这个阈值可以根据车型微调
+            return
+
         self.has_collided = True
 
     def close(self):
@@ -406,3 +458,14 @@ class CarlaGymEnv(gym.Env):
             self.world.apply_settings(settings)
         except Exception:
             pass
+
+    def start_recording(self, filename):
+        """开启 CARLA 官方录制器，记录所有 Actor 轨迹"""
+        # 文件会保存在 CARLA 服务端所在的路径下 (例如 /carla/dist/carla/PythonAPI/examples/)
+        print(f"开始录制到文件: {filename}")
+        self.client.start_recorder(filename)
+
+    def stop_recording(self):
+        """停止录制"""
+        print("停止录制。")
+        self.client.stop_recorder()

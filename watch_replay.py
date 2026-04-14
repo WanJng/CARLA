@@ -3,7 +3,7 @@ import time
 
 
 def main():
-    recording_name = "ppo_final_eval_17.log"
+    recording_name = "ppo_final_eval_20.log"
     client = carla.Client('localhost', 2000)
     client.set_timeout(10.0)
 
@@ -39,7 +39,7 @@ def main():
     # 在环境代码中，自车是特斯拉，NPC是奥迪。我们专门找出特斯拉的 ID
     ego_vehicle = None
     for v in vehicles:
-        if 'tesla' in v.type_id:
+        if 'tesla.model3' in v.type_id:
             ego_vehicle = v
             break
 
